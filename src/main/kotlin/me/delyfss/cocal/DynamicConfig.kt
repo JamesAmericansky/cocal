@@ -24,7 +24,14 @@ abstract class DynamicConfig(
         val debounceDelayMs: Long = 1000L
     )
 
-    private val scheduler = Executors.newSingleThreadScheduledExecutor()
+    companion object {
+        private val scheduler = Executors.newSingleThreadScheduledExecutor { run ->
+            val thread = Thread(run, "Config-Saver-Thread")
+            thread.isDaemon = true
+            thread
+        }
+    }
+
     private var saveTask: java.util.concurrent.ScheduledFuture<*>? = null
 
     private val properties by lazy {
@@ -34,8 +41,12 @@ abstract class DynamicConfig(
     }
 
     fun update(block: () -> Unit) {
-        block()
-        scheduleSave()
+        try {
+            block()
+            scheduleSave()
+        } catch (e: Exception) {
+            throw IllegalStateException("Failed to update config: $fileName", e)
+        }
     }
 
     fun scheduleSave() {
@@ -47,6 +58,7 @@ abstract class DynamicConfig(
 
     @Synchronized
     fun save() {
+        folder.mkdirs()
         val file = File(folder, fileName)
         file.writeText(renderConfig(buildCurrentConfig()))
     }
@@ -118,8 +130,19 @@ abstract class DynamicConfig(
     private fun insertValue(target: MutableMap<String, Any?>, path: List<String>, rawValue: Any?) {
         if (path.isEmpty()) return
         var cursor = target
-        path.dropLast(1).forEach { key ->
-            cursor = cursor.getOrPut(key) { linkedMapOf<String, Any?>() } as MutableMap<String, Any?>
+        for (i in 0 until path.size - 1) {
+            val key = path[i]
+            val existing = cursor[key]
+
+            val nextMap = if (existing is MutableMap<*, *>) {
+                @Suppress("UNCHECKED_CAST")
+                existing as MutableMap<String, Any?>
+            } else {
+                val newMap = linkedMapOf<String, Any?>()
+                cursor[key] = newMap
+                newMap
+            }
+            cursor = nextMap
         }
         cursor[path.last()] = rawValue
     }
