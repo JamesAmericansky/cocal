@@ -7,8 +7,8 @@ import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.reflect.full.findAnnotation
+import kotlin.reflect.full.declaredMemberProperties
 import kotlin.reflect.jvm.isAccessible
-import kotlin.reflect.full.memberProperties
 import kotlin.collections.linkedMapOf
 import kotlin.reflect.jvm.javaField
 
@@ -16,7 +16,7 @@ abstract class DynamicConfig(
     val folder: File,
     val fileName: String,
     val options: Options = Options()
-) {
+) : AutoCloseable {
 
     data class Options(
         val header: List<String> = emptyList(),
@@ -24,26 +24,25 @@ abstract class DynamicConfig(
         val debounceDelayMs: Long = 1000L
     )
 
-    companion object {
-        private val scheduler = Executors.newSingleThreadScheduledExecutor { run ->
-            val thread = Thread(run, "Config-Saver-Thread")
-            thread.isDaemon = true
-            thread
-        }
+    private val scheduler = Executors.newSingleThreadScheduledExecutor { run ->
+        val thread = Thread(run, "Config-Saver-Thread")
+        thread.isDaemon = true
+        thread
     }
-
     private var saveTask: java.util.concurrent.ScheduledFuture<*>? = null
+    @Volatile private var closed = false
 
     private val properties by lazy {
-        this::class.memberProperties
-            .filter { it.javaField?.declaringClass == this::class.java }
+        this::class.declaredMemberProperties
+            .filter { it.javaField != null }
             .onEach { it.isAccessible = true }
     }
 
+    @Synchronized
     fun update(block: () -> Unit) {
         try {
             block()
-            scheduleSave()
+            scheduleSaveLocked()
         } catch (e: Exception) {
             throw IllegalStateException("Failed to update config: $fileName", e)
         }
@@ -51,13 +50,13 @@ abstract class DynamicConfig(
 
     fun scheduleSave() {
         synchronized(this) {
-            saveTask?.cancel(false)
-            saveTask = scheduler.schedule({ save() }, options.debounceDelayMs, TimeUnit.MILLISECONDS)
+            scheduleSaveLocked()
         }
     }
 
     @Synchronized
     fun save() {
+        if (closed) return
         folder.mkdirs()
         val file = File(folder, fileName)
         file.writeText(renderConfig(buildCurrentConfig()))
@@ -66,9 +65,9 @@ abstract class DynamicConfig(
     private fun buildCurrentConfig(): Config {
         val tree = linkedMapOf<String, Any?>()
         properties.forEach { prop ->
-            val path = prop.findAnnotation<Path>()?.value ?: prop.name
+            val path = pathAnnotation(prop)?.value ?: prop.name
             val value = prop.getter.call(this)
-            insertValue(tree, path.split('.'), convertValue(value))
+            insertValue(tree, path.split('.').filter { it.isNotBlank() }, convertValue(value))
         }
         return ConfigFactory.parseMap(tree)
     }
@@ -101,12 +100,12 @@ abstract class DynamicConfig(
         result: MutableMap<String, Any?>
     ) {
         val klass = instance::class
-        val properties = klass.memberProperties
-            .filter { it.javaField?.declaringClass == klass.java }
+        val properties = klass.declaredMemberProperties
+            .filter { it.javaField != null }
             .onEach { it.isAccessible = true }
 
         properties.forEach { prop ->
-            val pathSegments = (prefix + (prop.findAnnotation<Path>()?.value ?: prop.name)
+            val pathSegments = (prefix + (pathAnnotation(prop)?.value ?: prop.name)
                 .split('.')
                 .filter { it.isNotBlank() })
 
@@ -159,5 +158,25 @@ abstract class DynamicConfig(
 
         val header = options.header.joinToString("\n") { if (it.startsWith("#")) it else "# $it" }
         return "$header\n\n$rendered"
+    }
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        saveTask?.cancel(false)
+        scheduler.shutdown()
+    }
+
+    private fun scheduleSaveLocked() {
+        if (closed) return
+        saveTask?.cancel(false)
+        saveTask = scheduler.schedule({ save() }, options.debounceDelayMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun pathAnnotation(prop: kotlin.reflect.KProperty1<*, *>): Path? {
+        return prop.findAnnotation<Path>()
+            ?: prop.getter.findAnnotation<Path>()
+            ?: prop.javaField?.getAnnotation(Path::class.java)
     }
 }
